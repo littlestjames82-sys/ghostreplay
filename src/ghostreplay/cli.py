@@ -1,38 +1,68 @@
-"""GhostReplay CLI.
+"""GhostReplay command-line interface.
+
+GhostReplay is propose-only: it learns from recorded agent session
+transcripts you already have on disk and proposes GhostSlice profile
+improvements with evidence. It never applies a change on its own.
+The only command that writes a profile is ``apply``, and only after
+it prints the diff and you type ``yes`` in the terminal.
+
+Typical workflow (see ``README.md`` for the full quickstart)::
+
+    ghostreplay ingest  <project> <transcript>
+    ghostreplay analyse <project> <session-or-transcript> [--bundle <dir>]
+    ghostreplay propose <project> <session...> [--bundle <dir>]
+    ghostreplay apply   <project> [--proposal <file>]
+    ghostreplay restore <project>     # undo an apply
+    ghostreplay trend   <project>     # waste over time
 
 Commands:
-  ghostreplay ingest  <project> <transcript> [-o <dir>]
+  ingest
       Parse the ONE documented format (Claude Code session
-      JSON/JSONL, see transcript.py) into a canonical session at
-      <dir>/<session-id>.json (default <project>/.ghostreplay/).
-  ghostreplay analyse <project> <session-or-transcript>
-                      [--bundle <dir>] [-o <dir>]
-      (alias: analyze) Analyse one session, write REPLAY.md +
-      replay-report.json (default <project>/.ghostreplay/reports/
-      <session-id>/), and append the trend ledger.
-  ghostreplay propose <project> <session...> [--bundle <dir>]
-                      [-o <dir>]
-      Aggregate >= min_sessions sessions into a profile proposal
-      (ghostreplay-proposal.json + PROPOSAL.md). Proposal only.
-  ghostreplay apply   <project> [--proposal <file>]
-      Print the proposal diff, require an explicit yes typed in
-      the terminal, back the profile up, then apply. There is
-      deliberately NO --yes flag: the yes must be typed.
-  ghostreplay restore <project>
-      Undo an apply from .ghostslice.json.bak (or remove a
-      profile GhostReplay created).
-  ghostreplay trend   <project>
-      Session trend from .ghostreplay-history.jsonl.
+      JSON/JSONL, see :mod:`ghostreplay.transcript`) into a
+      canonical session at ``<dir>/<session-id>.json``
+      (default ``<project>/.ghostreplay/``). Run this once per
+      transcript if you want a stable file to pass to ``analyse``
+      and ``propose``; those commands also accept a raw transcript
+      directly, so ``ingest`` is optional.
+  analyse (alias: analyze)
+      Analyse one session against its GhostSlice bundle, write
+      ``REPLAY.md`` + ``replay-report.json`` (default
+      ``<project>/.ghostreplay/reports/<session-id>/``), and append
+      one record to the trend ledger
+      (``<project>/.ghostreplay-history.jsonl``).
+  propose
+      Aggregate at least ``min_sessions`` sessions (default 3) into
+      a profile proposal (``ghostreplay-proposal.json`` +
+      ``PROPOSAL.md``). Proposal only: nothing is applied.
+  apply
+      Print the proposal diff, require an explicit ``yes`` typed
+      in the terminal, back the profile up to
+      ``.ghostslice.json.bak``, then apply. There is deliberately
+      NO ``--yes`` flag: the yes must be typed interactively.
+  restore
+      Undo an ``apply`` from ``.ghostslice.json.bak`` (or remove a
+      profile GhostReplay created when none existed before).
+  trend
+      Print session cost and waste over time from the ledger.
 
-Exit codes: 0 ok, 1 findings-level refusal (e.g. proposal not
-ready, apply declined is 0 - a human said no, that is not an
-error), 2 user error (bad input, unrecognised format, invalid
-profile/proposal). Local files only; no network anywhere.
+Exit codes:
+  0  ok. Note: answering anything other than ``yes`` at the
+     ``apply`` prompt also exits 0: a human said no, that is not
+     an error.
+  1  findings-level refusal (for example, no terminal input was
+     available for the ``apply`` prompt, so nothing was applied).
+  2  user error (bad input, unrecognised transcript format,
+     invalid profile or proposal).
+
+Local files only; no network anywhere. Run
+``ghostreplay <command> --help`` for per-command arguments,
+defaults, and examples.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -52,6 +82,17 @@ def _err(msg: str) -> int:
     return 2
 
 
+def _safe_session_component(session_id) -> str:
+    """A sessionId comes from the transcript, i.e. untrusted data.
+    Used as a filename / directory component it must never contain
+    a path separator or '..': '../../x' would otherwise write the
+    canonical session (ingest) or reports (analyse) outside the
+    directory the user pointed --out / the project at."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "-",
+                  str(session_id or "")).lstrip(".")
+    return safe or "session"
+
+
 def _load(project: Path, session_path: str, bundle_arg):
     session = load_session(session_path)
     bundle = find_bundle(project, bundle_arg)
@@ -59,6 +100,7 @@ def _load(project: Path, session_path: str, bundle_arg):
 
 
 def cmd_ingest(args) -> int:
+    """Implement ``ingest``: parse one transcript to a canonical file."""
     project = Path(args.project)
     try:
         session = parse_transcript(args.transcript)
@@ -66,7 +108,7 @@ def cmd_ingest(args) -> int:
         return _err(str(exc))
     out_dir = Path(args.out) if args.out else project / ".ghostreplay"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / f"{session['session_id']}.json"
+    out = out_dir / f"{_safe_session_component(session['session_id'])}.json"
     out.write_text(dump_canonical(session), encoding="utf-8")
     print(f"ingested session {session['session_id']}: "
           f"{session['entry_count']} entries, "
@@ -79,6 +121,7 @@ def cmd_ingest(args) -> int:
 
 
 def cmd_analyse(args) -> int:
+    """Implement ``analyse``/``analyze``: one session, reports + ledger."""
     project = Path(args.project)
     try:
         session, bundle = _load(project, args.session, args.bundle)
@@ -86,7 +129,8 @@ def cmd_analyse(args) -> int:
     except (TranscriptError, BundleError, ValueError) as exc:
         return _err(str(exc))
     out_dir = Path(args.out) if args.out else (
-        project / ".ghostreplay" / "reports" / session["session_id"])
+        project / ".ghostreplay" / "reports"
+        / _safe_session_component(session["session_id"]))
     json_path, md_path = write_reports(report, out_dir)
     append_record(project, report)
     t = report["totals"]
@@ -106,6 +150,7 @@ def cmd_analyse(args) -> int:
 
 
 def cmd_propose(args) -> int:
+    """Implement ``propose``: aggregate sessions, write a proposal only."""
     project = Path(args.project)
     try:
         cfg = load_replay_config(project)
@@ -131,7 +176,8 @@ def cmd_propose(args) -> int:
           f"(minimum {proposal['min_sessions_required']}); status: "
           f"{proposal['status']}; profile changes proposed: "
           f"{len(proposal['changes'])}; recall candidates: "
-          f"{len(proposal['recall_candidates'])}")
+          f"{len(proposal['recall_candidates'])}; re-read hotspots: "
+          f"{len(proposal.get('reread_hotspots') or [])}")
     print(f"proposal -> {md_path} , {json_path}")
     print("nothing applied: run `ghostreplay apply` and type yes "
           "to apply")
@@ -139,6 +185,7 @@ def cmd_propose(args) -> int:
 
 
 def cmd_apply(args) -> int:
+    """Implement ``apply``: show the diff, require a typed ``yes``, apply."""
     project = Path(args.project)
     proposal_path = Path(args.proposal) if args.proposal else (
         project / ".ghostreplay" / "ghostreplay-proposal.json")
@@ -179,6 +226,7 @@ def cmd_apply(args) -> int:
 
 
 def cmd_restore(args) -> int:
+    """Implement ``restore``: undo the most recent ``apply``."""
     project = Path(args.project)
     try:
         msg = restore_profile(project)
@@ -189,6 +237,7 @@ def cmd_restore(args) -> int:
 
 
 def cmd_trend(args) -> int:
+    """Implement ``trend``: summarise the ledger, one row per session."""
     project = Path(args.project)
     summary = trend_summary(read_records(project))
     if summary["records"] == 0:
@@ -215,57 +264,165 @@ def cmd_trend(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the argument parser.
+
+    Help text only: argument names, defaults, and destinations here
+    are the CLI contract (see ``tests/test_cli_contract.py``) and
+    must not change without updating the contract.
+    """
     ap = argparse.ArgumentParser(
         prog="ghostreplay",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="GhostReplay: learn from local agent session "
                     "transcripts, propose GhostSlice profile "
-                    "improvements with evidence (propose-only).")
+                    "improvements with evidence (propose-only).",
+        epilog="Workflow:\n"
+               "  1. ingest   (optional) register a transcript\n"
+               "  2. analyse  report on one session\n"
+               "  3. propose  draft profile changes from 3+ sessions\n"
+               "  4. apply    apply a proposal after a typed yes\n"
+               "     restore  undo an apply; trend shows waste over time\n"
+               "\n"
+               "Examples:\n"
+               "  ghostreplay analyse ./my-project ./session.jsonl "
+               "--bundle ./my-project-context\n"
+               "  ghostreplay propose ./my-project s1.jsonl s2.jsonl "
+               "s3.jsonl --bundle ./my-project-context\n"
+               "\n"
+               "Local files only; no network. Token figures are "
+               "estimates. Run 'ghostreplay <command> --help' for "
+               "per-command help.")
     ap.add_argument("--version", action="version",
                     version=f"ghostreplay {__version__}")
     sub = ap.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("ingest", help="parse a transcript into a "
-                                      "canonical session")
-    p.add_argument("project")
-    p.add_argument("transcript")
-    p.add_argument("-o", "--out")
+    p = sub.add_parser(
+        "ingest",
+        help="parse a transcript into a canonical session",
+        description="Parse one transcript in the documented Claude "
+                    "Code JSONL / JSON format into a canonical "
+                    "session file. Optional: 'analyse' and "
+                    "'propose' also accept a raw transcript "
+                    "directly.",
+        epilog="Example:\n"
+               "  ghostreplay ingest ./my-project "
+               "~/sessions/session.jsonl\n"
+               "  # writes ./my-project/.ghostreplay/<session-id>.json")
+    p.add_argument("project",
+                   help="project directory (used for the default "
+                        "output location)")
+    p.add_argument("transcript",
+                   help="path to a Claude Code transcript "
+                        "(.jsonl, one JSON object per line, or a "
+                        "single JSON document; see README)")
+    p.add_argument("-o", "--out",
+                   help="output directory "
+                        "(default: <project>/.ghostreplay/)")
     p.set_defaults(fn=cmd_ingest)
 
     for name in ("analyse", "analyze"):
-        p = sub.add_parser(name, help="analyse one session")
-        p.add_argument("project")
-        p.add_argument("session")
+        p = sub.add_parser(
+            name,
+            help="analyse one session",
+            description="Analyse one session against the "
+                        "GhostSlice bundle that produced it. Writes "
+                        "REPLAY.md and replay-report.json and "
+                        "appends one record to the trend ledger.",
+            epilog="Example:\n"
+                   "  ghostreplay analyse ./my-project "
+                   "./session.jsonl --bundle ./my-project-context "
+                   "--out /tmp/replay-out")
+        p.add_argument("project",
+                       help="project directory the session ran in")
+        p.add_argument("session",
+                       help="canonical session file from 'ingest', "
+                            "or a raw transcript (parsed on the fly)")
         p.add_argument("--bundle", help="GhostSlice bundle dir or "
                                         "manifest.json (default: "
-                                        "<project>/.claude_context)")
-        p.add_argument("-o", "--out")
+                                        "<project>/.claude_context; "
+                                        "if none is found, bundle "
+                                        "comparisons are reported as "
+                                        "unavailable, not guessed)")
+        p.add_argument("-o", "--out",
+                       help="output directory (default: "
+                            "<project>/.ghostreplay/reports/"
+                            "<session-id>/)")
         p.set_defaults(fn=cmd_analyse)
 
-    p = sub.add_parser("propose", help="aggregate sessions into a "
-                                       "profile proposal")
-    p.add_argument("project")
-    p.add_argument("sessions", nargs="+")
-    p.add_argument("--bundle")
-    p.add_argument("-o", "--out")
+    p = sub.add_parser(
+        "propose",
+        help="aggregate sessions into a profile proposal",
+        description="Aggregate sessions into a proposed "
+                    ".ghostslice.json profile diff with evidence "
+                    "per change. Proposal only: this command never "
+                    "modifies your profile. Use 'apply' for that.",
+        epilog="Example:\n"
+               "  ghostreplay propose ./my-project s1.jsonl "
+               "s2.jsonl s3.jsonl --bundle ./my-project-context\n"
+               "  # writes ghostreplay-proposal.json + PROPOSAL.md")
+    p.add_argument("project",
+                   help="project directory containing (or to "
+                        "contain) .ghostslice.json")
+    p.add_argument("sessions", nargs="+",
+                   help="session or transcript files, one per "
+                        "recorded session; at least 3 by default "
+                        "(tunable via the profile's 'replay' "
+                        "section) or the proposal is marked "
+                        "insufficient-sessions with no changes")
+    p.add_argument("--bundle",
+                   help="GhostSlice bundle dir or manifest.json "
+                        "(default: <project>/.claude_context)")
+    p.add_argument("-o", "--out",
+                   help="output directory "
+                        "(default: <project>/.ghostreplay/)")
     p.set_defaults(fn=cmd_propose)
 
-    p = sub.add_parser("apply", help="apply a proposal after an "
-                                     "explicit terminal yes")
-    p.add_argument("project")
-    p.add_argument("--proposal")
+    p = sub.add_parser(
+        "apply",
+        help="apply a proposal after an explicit terminal yes",
+        description="Print a proposal's diff, ask for an explicit "
+                    "'yes' typed in the terminal, back the current "
+                    "profile up to .ghostslice.json.bak, then apply. "
+                    "There is deliberately no --yes flag.",
+        epilog="Example:\n"
+               "  ghostreplay apply ./my-project "
+               "--proposal /tmp/replay-prop/ghostreplay-proposal.json\n"
+               "Undo with: ghostreplay restore ./my-project")
+    p.add_argument("project",
+                   help="project directory whose .ghostslice.json "
+                        "will be updated (after your typed yes)")
+    p.add_argument("--proposal",
+                   help="proposal JSON file (default: "
+                        "<project>/.ghostreplay/"
+                        "ghostreplay-proposal.json)")
     p.set_defaults(fn=cmd_apply)
 
-    p = sub.add_parser("restore", help="undo an apply")
-    p.add_argument("project")
+    p = sub.add_parser(
+        "restore",
+        help="undo an apply",
+        description="Undo an 'apply': restore .ghostslice.json "
+                    "from .ghostslice.json.bak, or remove a profile "
+                    "GhostReplay created when none existed before.")
+    p.add_argument("project",
+                   help="project directory to restore")
     p.set_defaults(fn=cmd_restore)
 
-    p = sub.add_parser("trend", help="session trend from the ledger")
-    p.add_argument("project")
+    p = sub.add_parser(
+        "trend",
+        help="session trend from the ledger",
+        description="Show estimated cost and waste per session "
+                    "over time, read from "
+                    "<project>/.ghostreplay-history.jsonl. Run "
+                    "'analyse' at least once first so the ledger "
+                    "has records.")
+    p.add_argument("project",
+                   help="project directory whose ledger to read")
     p.set_defaults(fn=cmd_trend)
     return ap
 
 
 def main(argv=None) -> int:
+    """Entry point: parse ``argv`` (default: ``sys.argv``) and dispatch."""
     args = build_parser().parse_args(argv)
     return args.fn(args)
 

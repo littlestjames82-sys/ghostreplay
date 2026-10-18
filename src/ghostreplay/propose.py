@@ -23,6 +23,14 @@ defaults in profile.REPLAY_DEFAULTS):
 - recall_candidate (not a profile change): an instruction block
   cluster repeated across >= 2 sessions. Listed so a human can
   move it into GhostRecall / a standing prompt; apply ignores it.
+- reread_hotspot (not a profile change): a file with re-reads in
+  at least 2 analysed sessions - chronic re-reading, not one odd
+  run. Aggregates the per-session re-read evidence (extra reads,
+  estimated re-read tokens, worst single-session turn count) so
+  a human can decide whether the file should be pinned, cached,
+  summarised, or split. There is no single correct profile edit
+  for a re-read, so GhostReplay deliberately proposes none here;
+  apply ignores hotspots exactly as it ignores recall candidates.
 
 A zero-waste input produces an EMPTY changes list. A tool that
 always finds savings is inventing them (PLAN.md).
@@ -40,6 +48,37 @@ from .analysis import repetition_clusters
 def build_proposal(project: str, session_reports: list[dict],
                    session_blocks: list[dict], cfg: dict,
                    current_modes: dict, current_entry_points: list) -> dict:
+    """Aggregate per-session reports into a proposal dict.
+
+    Pure aggregation: no files are read or written here, and no
+    change is applied. Below ``cfg['min_sessions']`` the proposal
+    is marked ``insufficient-sessions`` and its would-be changes
+    are returned as diagnostics only, never as applicable changes.
+    """
+    # The same session submitted repeatedly is still ONE session.
+    # Without this, `propose s1 s1 s1` satisfied the >=min_sessions
+    # gate (and triple-counted every evidence figure), defeating
+    # the rule that one odd run must not rewrite a profile.
+    seen_ids: set = set()
+    unique_reports: list[dict] = []
+    for report in session_reports:
+        sid = report.get("session_id")
+        if isinstance(sid, str) and sid:
+            if sid in seen_ids:
+                continue
+            seen_ids.add(sid)
+        unique_reports.append(report)
+    session_reports = unique_reports
+    seen_blocks: set = set()
+    unique_blocks: list[dict] = []
+    for block in session_blocks:
+        key = (block.get("session_id"), block.get("turn"),
+               block.get("text"))
+        if key in seen_blocks:
+            continue
+        seen_blocks.add(key)
+        unique_blocks.append(block)
+    session_blocks = unique_blocks
     n = len(session_reports)
     present: dict[str, int] = defaultdict(int)
     referenced: dict[str, int] = defaultdict(int)
@@ -123,6 +162,44 @@ def build_proposal(project: str, session_reports: list[dict],
                 "sessions_referenced": referenced[path],
             })
 
+    # Cross-session re-read hotspots (diagnostic, not changes).
+    reread_sessions: dict[str, int] = defaultdict(int)
+    reread_extra: dict[str, int] = defaultdict(int)
+    reread_tokens: dict[str, int] = defaultdict(int)
+    reread_max_turns: dict[str, int] = defaultdict(int)
+    for report in session_reports:
+        for r in report.get("rereads", []):
+            path = r["path"]
+            reread_sessions[path] += 1
+            reread_extra[path] += r.get("extra_reads", 0)
+            reread_tokens[path] += r.get("estimated_reread_tokens", 0)
+            reread_max_turns[path] = max(
+                reread_max_turns[path], r.get("distinct_turns", 0))
+    reread_hotspots = []
+    for path in sorted(reread_sessions):
+        if reread_sessions[path] < 2:
+            continue
+        reread_hotspots.append({
+            "kind": "reread_hotspot",
+            "target": path,
+            "evidence": (
+                f"re-read in {reread_sessions[path]}/{n} sessions, "
+                f"{reread_extra[path]} extra reads in total, "
+                f"~{reread_tokens[path]} estimated re-read tokens "
+                f"across those sessions, up to "
+                f"{reread_max_turns[path]} distinct tool-input "
+                "turns in one session; chronic re-reading is a "
+                "signal to pin, cache, summarise, or split the "
+                "file - a human decision, not a profile change"),
+            "sessions_with_rereads": reread_sessions[path],
+            "sessions_analysed": n,
+            "total_extra_reads": reread_extra[path],
+            "total_estimated_reread_tokens": reread_tokens[path],
+            "max_distinct_turns_in_one_session": reread_max_turns[path],
+        })
+    reread_hotspots.sort(key=lambda h: (
+        -h["total_estimated_reread_tokens"], h["target"]))
+
     recall_candidates = []
     if n >= 2:
         for cluster in repetition_clusters(session_blocks):
@@ -164,6 +241,7 @@ def build_proposal(project: str, session_reports: list[dict],
         "changes": [] if insufficient else changes,
         "diagnostic_changes": changes if insufficient else [],
         "recall_candidates": recall_candidates,
+        "reread_hotspots": reread_hotspots,
         "qualifiers": [
             "'Not referenced in transcript' does not prove a file "
             "was not needed; transcripts can omit silent reads.",
@@ -174,6 +252,7 @@ def build_proposal(project: str, session_reports: list[dict],
 
 
 def _current_mode(current_modes: dict, path: str, bundle_mode: str) -> str:
+    """Human-readable current mode for ``path``, noting its source."""
     for pat, mode in current_modes.items():
         if pat == path:
             return f"{mode} (profile)"
@@ -181,6 +260,7 @@ def _current_mode(current_modes: dict, path: str, bundle_mode: str) -> str:
 
 
 def render_proposal_md(proposal: dict) -> str:
+    """Render ``PROPOSAL.md`` from a proposal dict."""
     lines = [
         "# GhostReplay profile proposal",
         "",
@@ -218,6 +298,13 @@ def render_proposal_md(proposal: dict) -> str:
             lines.append(f"- block {c['fingerprint']}: {c['evidence']}")
     else:
         lines.append("None.")
+    lines += ["", "## Re-read hotspots (not profile changes)", ""]
+    hotspots = proposal.get("reread_hotspots") or []
+    if hotspots:
+        for h in hotspots:
+            lines.append(f"- {h['target']}: {h['evidence']}")
+    else:
+        lines.append("None.")
     lines += ["", "## Qualifiers", ""]
     for q in proposal["qualifiers"]:
         lines.append(f"- {q}")
@@ -226,6 +313,7 @@ def render_proposal_md(proposal: dict) -> str:
 
 
 def write_proposal(proposal: dict, out_dir: str | Path) -> tuple[Path, Path]:
+    """Write proposal JSON + ``PROPOSAL.md``; return ``(json, md)``."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "ghostreplay-proposal.json"
@@ -238,6 +326,7 @@ def write_proposal(proposal: dict, out_dir: str | Path) -> tuple[Path, Path]:
 
 
 def load_proposal(path: str | Path) -> dict:
+    """Load a proposal file, rejecting wrong formats and non-ready status."""
     path = Path(path)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -250,4 +339,31 @@ def load_proposal(path: str | Path) -> dict:
         raise ValueError(
             f"{path}: proposal status is {data.get('status')!r}; "
             "only a 'ready' proposal can be applied")
+    # A 'ready' proposal with a missing/malformed changes list used
+    # to pass here and then crash apply with a bare KeyError.
+    # Validate the shape apply relies on, loudly, at load time.
+    changes = data.get("changes")
+    if not isinstance(changes, list):
+        raise ValueError(f"{path}: proposal 'changes' must be a list")
+    for i, change in enumerate(changes):
+        if not isinstance(change, dict):
+            raise ValueError(
+                f"{path}: proposal changes[{i}] must be an object")
+        for key in ("kind", "target", "current", "proposed",
+                    "evidence"):
+            if not isinstance(change.get(key), str):
+                raise ValueError(
+                    f"{path}: proposal changes[{i}] needs a string "
+                    f"{key!r}")
+    for key in ("diagnostic_changes", "recall_candidates"):
+        if key in data and not isinstance(data[key], list):
+            raise ValueError(f"{path}: proposal {key!r} must be a list")
+        data.setdefault(key, [])
+    if "sessions_analysed" in data and (
+            isinstance(data["sessions_analysed"], bool)
+            or not isinstance(data["sessions_analysed"], int)):
+        raise ValueError(
+            f"{path}: proposal 'sessions_analysed' must be a "
+            "whole number")
+    data.setdefault("sessions_analysed", 0)
     return data

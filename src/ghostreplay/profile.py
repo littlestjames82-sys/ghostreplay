@@ -42,6 +42,12 @@ REPLAY_DEFAULTS = {
 
 
 def load_replay_config(project: str | Path) -> dict:
+    """Return the effective replay thresholds for ``project``.
+
+    Starts from :data:`REPLAY_DEFAULTS` and overlays the profile's
+    ``replay`` section when present. Unknown keys or invalid values
+    raise ``ValueError`` loudly rather than being ignored.
+    """
     cfg = dict(REPLAY_DEFAULTS)
     path = Path(project) / PROFILE_NAME
     if not path.is_file():
@@ -71,6 +77,7 @@ def load_replay_config(project: str | Path) -> dict:
 
 
 def read_profile_data(project: str | Path) -> tuple[dict, Path]:
+    """Read ``.ghostslice.json``; return ``(data, path)`` (``{}`` if absent)."""
     path = Path(project) / PROFILE_NAME
     if not path.is_file():
         return {}, path
@@ -200,6 +207,7 @@ def apply_changes(project: str | Path, changes: list[dict]) -> dict:
 
 
 def restore_profile(project: str | Path) -> str:
+    """Undo an apply; return a human-readable description of what happened."""
     project = Path(project)
     path = project / PROFILE_NAME
     backup_path = project / BACKUP_NAME

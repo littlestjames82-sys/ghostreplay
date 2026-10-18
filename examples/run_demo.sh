@@ -1,6 +1,11 @@
 #!/bin/sh
 # GhostReplay demo: analyse the planted-waste example transcript.
-# Local only. Writes reports to /tmp/replay-demo (never into the repo).
+# Local only, no network. Writes reports to /tmp/replay-demo (never
+# into the repo) and appends one record to the sample project's
+# trend ledger, like any analyse run.
+# Usage: sh examples/run_demo.sh   (from anywhere; it cds to the repo root)
+# Then read /tmp/replay-demo/REPLAY.md and compare it with
+# examples/EXPECTED_OUTPUT.md.
 set -eu
 cd "$(dirname "$0")/.."
 

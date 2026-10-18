@@ -12,10 +12,19 @@ Definitions (deterministic, no model):
   basename when unique in the bundle) appears in turn text, OR an
   Edit/Write tool targets it. Turn = the canonical turn it appears
   in; a file can be referenced in many turns.
-- re-read(file): referenced as a file INPUT or full Read in >= 2
-  distinct turns. Extra reads = references_in_distinct_turns - 1.
-  Re-read cost = extra * the file's sliced_tokens (bundle) or its
-  on-disk estimated tokens, labelled an estimate.
+- re-read(file): named as a tool_use file INPUT (Read, Edit, or
+  any other tool carrying a file path) in >= 2 distinct turns.
+  Text mentions count as references (they keep a file out of the
+  not-referenced list) but NEVER as re-reads: mentioning a path in
+  prose does not re-spend the file's context tokens, so charging
+  sliced tokens for it would invent waste. Extra reads =
+  distinct_input_turns - 1. Re-read cost = extra * the file's
+  sliced_tokens (bundle), labelled an estimate.
+- turn timeline: one row per turn (direct reads, edits, files
+  referenced, and the re-read tokens spent in that turn with a
+  running cumulative total). The per-turn re-read tokens always
+  sum to the report's total re-read waste: the timeline is an
+  accounting view of the same figure, not a second estimate.
 - mode friction(file/symbol): a bundle file sent in a non-full
   mode that the session later pulls in directly via a Read
   tool_use (the agent asking for the body it was not given).
@@ -45,6 +54,19 @@ _READ_TOOLS = {"Read", "NotebookRead"}
 _EDIT_TOOLS = {"Edit", "Write", "NotebookEdit"}
 
 
+def _inside_project(project: Path, rel: str) -> Path | None:
+    """Resolve a bundle-relative path, refusing absolute paths and
+    '..' escapes: a manifest is data, and a crafted entry must not
+    make GhostReplay read files outside the project tree."""
+    try:
+        root = Path(project).resolve()
+        fpath = (root / rel).resolve()
+        fpath.relative_to(root)
+    except (ValueError, OSError):
+        return None
+    return fpath
+
+
 def _symbol_outline(project: Path | None, rel: str) -> list[str]:
     """Symbol names for one bundle file: def/class/function names
     from the file on disk, when present. Regex-level on purpose
@@ -52,7 +74,9 @@ def _symbol_outline(project: Path | None, rel: str) -> list[str]:
     to attribute friction mentions."""
     if project is None:
         return []
-    fpath = Path(project) / rel
+    fpath = _inside_project(Path(project), rel)
+    if fpath is None:
+        return []
     try:
         text = fpath.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -66,6 +90,7 @@ def _symbol_outline(project: Path | None, rel: str) -> list[str]:
 
 
 def shingle_set(text: str, size: int = 3) -> set[str]:
+    """Set of normalised ``size``-line shingles, for duplicate detection."""
     lines = [ln.strip().lower() for ln in text.splitlines() if ln.strip()]
     if len(lines) < size:
         return {"\n".join(lines)} if lines else set()
@@ -151,11 +176,20 @@ def analyse_session(session: dict, bundle: dict | None,
     ref_turns: dict[str, set[int]] = {p: set() for p in bundle_paths}
     ref_kinds: dict[str, set[str]] = {p: set() for p in bundle_paths}
     direct_reads: dict[str, list[int]] = {p: [] for p in bundle_paths}
+    # Distinct turns in which a file was a tool_use file INPUT.
+    # This (not ref_turns) is the re-read basis: text mentions are
+    # references, but they do not re-spend the file's tokens.
+    input_turns: dict[str, set[int]] = {p: set() for p in bundle_paths}
+    # Per-turn accounting for the turn timeline.
+    timeline_map: dict[int, dict] = {}
     blocks: list[dict] = []
     session_text_tokens = 0
 
     for turn in session.get("turns", []):
         tno = turn["turn"]
+        slot = timeline_map.setdefault(tno, {
+            "referenced": set(), "direct_reads": [],
+            "edits": [], "tool_inputs": []})
         for block in turn.get("instruction_blocks", []):
             blocks.append({"session_id": session["session_id"],
                            "turn": tno, "text": block})
@@ -168,6 +202,7 @@ def analyse_session(session: dict, bundle: dict | None,
                 if p in text:
                     ref_turns[p].add(tno)
                     ref_kinds[p].add("text-mention")
+                    slot["referenced"].add(p)
                 else:
                     base = p.rsplit("/", 1)[-1]
                     if base not in ambiguous_basenames and \
@@ -175,6 +210,7 @@ def analyse_session(session: dict, bundle: dict | None,
                                       r"(?![\w.-])", text):
                         ref_turns[p].add(tno)
                         ref_kinds[p].add("text-mention")
+                        slot["referenced"].add(p)
         for tool_use in turn.get("tool_uses", []):
             for cand in tool_use.get("file_paths", []):
                 if not bundle:
@@ -183,11 +219,16 @@ def analyse_session(session: dict, bundle: dict | None,
                 if matched is None:
                     continue
                 ref_turns[matched].add(tno)
+                input_turns[matched].add(tno)
+                slot["referenced"].add(matched)
+                slot["tool_inputs"].append(matched)
                 if tool_use["name"] in _EDIT_TOOLS:
                     ref_kinds[matched].add("edited")
+                    slot["edits"].append(matched)
                 elif tool_use["name"] in _READ_TOOLS:
                     ref_kinds[matched].add("direct-read")
                     direct_reads[matched].append(tno)
+                    slot["direct_reads"].append(matched)
                 else:
                     ref_kinds[matched].add("tool-input")
 
@@ -227,16 +268,21 @@ def analyse_session(session: dict, bundle: dict | None,
                 "turns": turns, "kinds": sorted(ref_kinds[p]),
                 "sliced_tokens": sliced,
             })
-            if len(turns) >= 2:
-                extra = len(turns) - 1
+            # Re-reads are charged on tool-input turns only (see
+            # module docstring); `turns` above is every reference
+            # turn, including text mentions, and stays as evidence.
+            iturns = sorted(input_turns[p])
+            if len(iturns) >= 2:
+                extra = len(iturns) - 1
                 cost = extra * sliced
                 total_reread_cost += cost
                 rereads.append({
-                    "path": p, "turns": turns,
-                    "distinct_turns": len(turns),
+                    "path": p, "turns": iturns,
+                    "distinct_turns": len(iturns),
                     "extra_reads": extra,
                     "sliced_tokens_each": sliced,
                     "estimated_reread_tokens": cost,
+                    "direct_read_turns": sorted(set(direct_reads[p])),
                 })
             if entry["mode"] != "full" and direct_reads[p]:
                 friction_files.append({
@@ -265,6 +311,32 @@ def analyse_session(session: dict, bundle: dict | None,
         friction_files.sort(key=lambda r: (-r["count"], r["path"]))
         friction_symbols.sort(key=lambda r: (-r["count"], r["path"],
                                              r["symbol"]))
+
+    # Turn timeline: a turn spends re-read tokens for each bundle
+    # file it names as a tool input that an EARLIER turn already
+    # named as a tool input (once per file per turn, however many
+    # times the turn repeats it). Summed over all turns this is
+    # exactly total_reread_cost above.
+    turn_timeline: list[dict] = []
+    seen_inputs: set[str] = set()
+    cumulative_reread = 0
+    for tno in sorted(timeline_map):
+        slot = timeline_map[tno]
+        inputs_here = sorted(set(slot["tool_inputs"]))
+        reread_here = [p for p in inputs_here if p in seen_inputs]
+        cost_here = sum(bundle_files[p]["sliced_tokens"]
+                        for p in reread_here) if bundle else 0
+        cumulative_reread += cost_here
+        turn_timeline.append({
+            "turn": tno,
+            "referenced_files": sorted(slot["referenced"]),
+            "direct_read_files": sorted(set(slot["direct_reads"])),
+            "edited_files": sorted(set(slot["edits"])),
+            "reread_files": reread_here,
+            "reread_estimated_tokens": cost_here,
+            "cumulative_reread_estimated_tokens": cumulative_reread,
+        })
+        seen_inputs.update(inputs_here)
 
     repetitions = repetition_clusters(blocks)
     waste = total_unreferenced + total_reread_cost
@@ -302,6 +374,7 @@ def analyse_session(session: dict, bundle: dict | None,
         # docstring for why the qualifier must not be dropped).
         "not_referenced": unreferenced,
         "rereads": rereads,
+        "turn_timeline": turn_timeline,
         "mode_friction": {
             "files": friction_files,
             "symbols": friction_symbols,
@@ -328,13 +401,19 @@ def analyse_session(session: dict, bundle: dict | None,
             "No transcript text is quoted in this report; secret-"
             "shaped strings are redacted and findings are recorded "
             "as source + line + type only.",
+            "Re-reads are charged only for turns that name the "
+            "file as a tool input; a text mention is a reference, "
+            "not a re-read, and is never charged the file's tokens.",
         ],
     }
     return secrets.sanitize_obj(report)
 
 
 def file_token_estimate(project: str | Path, rel: str) -> int:
-    fpath = Path(project) / rel
+    """Estimated tokens for one project file on disk (0 if unreadable)."""
+    fpath = _inside_project(Path(project), rel)
+    if fpath is None:
+        return 0
     try:
         text = fpath.read_text(encoding="utf-8", errors="replace")
     except OSError:

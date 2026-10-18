@@ -168,7 +168,12 @@ def _entries_from_raw(raw_text: str, source_name: str) -> list[dict]:
 
 
 def parse_transcript(path: str | Path) -> dict:
-    """Parse a transcript file into the canonical session dict."""
+    """Parse a transcript file into the canonical session dict.
+
+    Raises :class:`TranscriptError` naming the offending line or
+    field when the file is not the one documented format: ingest
+    fails loudly rather than analysing an unknown shape badly.
+    """
     path = Path(path)
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
@@ -223,9 +228,12 @@ def parse_transcript(path: str | Path) -> dict:
             turns.append(current)
         usage = message.get("usage")
         if isinstance(usage, dict):
-            if isinstance(usage.get("input_tokens"), int):
+            # bool is a subclass of int: a JSON true/false in a
+            # usage field is not a token count and must not be
+            # silently counted as 1/0 reported tokens.
+            if type(usage.get("input_tokens")) is int:
                 reported_in += usage["input_tokens"]
-            if isinstance(usage.get("output_tokens"), int):
+            if type(usage.get("output_tokens")) is int:
                 reported_out += usage["output_tokens"]
         if isinstance(message.get("model"), str):
             models.add(message["model"])
@@ -276,8 +284,13 @@ def parse_transcript(path: str | Path) -> dict:
 
 
 def load_session(path: str | Path) -> dict:
-    """Load a session for analysis: a canonical session file, or a
-    raw transcript (parsed on the fly)."""
+    """Load a session for analysis.
+
+    Accepts either a canonical session file written by ``ingest``
+    (format ``ghostreplay-session/1``) or a raw transcript, which
+    is parsed on the fly. This is why ``analyse`` and ``propose``
+    work with or without a prior ``ingest`` step.
+    """
     path = Path(path)
     try:
         raw = path.read_text(encoding="utf-8", errors="replace")
@@ -290,8 +303,33 @@ def load_session(path: str | Path) -> dict:
         except ValueError:
             doc = None
         if isinstance(doc, dict) and doc.get("format") == CANONICAL_FORMAT:
+            _validate_canonical(doc, str(path))
             return doc
     return parse_transcript(path)
+
+
+def _validate_canonical(doc: dict, source: str) -> None:
+    """A file that merely claims the canonical format but lacks the
+    fields analysis relies on must fail loudly (TranscriptError),
+    not crash later with a bare KeyError/TypeError."""
+    if not isinstance(doc.get("session_id"), str) or not doc["session_id"]:
+        raise TranscriptError(
+            f"{source}: canonical session has no string 'session_id'")
+    turns = doc.get("turns")
+    if not isinstance(turns, list):
+        raise TranscriptError(
+            f"{source}: canonical session 'turns' must be a list")
+    for i, turn in enumerate(turns):
+        if not isinstance(turn, dict) or type(turn.get("turn")) is not int:
+            raise TranscriptError(
+                f"{source}: canonical session turns[{i}] must be an "
+                "object with an integer 'turn'")
+        for key in ("texts", "tool_uses", "file_inputs",
+                    "instruction_blocks"):
+            if key in turn and not isinstance(turn[key], list):
+                raise TranscriptError(
+                    f"{source}: canonical session turns[{i}].{key} "
+                    "must be a list")
 
 
 def dump_canonical(session: dict) -> str:

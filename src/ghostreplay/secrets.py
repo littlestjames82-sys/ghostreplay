@@ -48,6 +48,7 @@ def scan_lines(lines: list[str], source: str) -> list[dict]:
 
 
 def scan_text(text: str, source: str) -> list[dict]:
+    """Scan a whole text blob; see :func:`scan_lines` for the contract."""
     return scan_lines(text.splitlines(), source)
 
 
@@ -68,5 +69,9 @@ def sanitize_obj(obj):
     if isinstance(obj, list):
         return [sanitize_obj(v) for v in obj]
     if isinstance(obj, dict):
-        return {k: sanitize_obj(v) for k, v in obj.items()}
+        # Keys are strings too and can carry a secret (e.g. a bundle
+        # path or a session-supplied name used as a mapping key);
+        # sanitizing only values would leak those verbatim.
+        return {(sanitize(k) if isinstance(k, str) else k):
+                sanitize_obj(v) for k, v in obj.items()}
     return obj

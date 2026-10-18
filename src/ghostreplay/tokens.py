@@ -54,6 +54,7 @@ _EXT_LANGUAGE = {
 
 
 def language_for_path(path: str) -> str | None:
+    """Best-guess language name from a file extension, or ``None``."""
     for ext, lang in _EXT_LANGUAGE.items():
         if path.endswith(ext):
             return lang
@@ -61,6 +62,7 @@ def language_for_path(path: str) -> str | None:
 
 
 def looks_minified(text: str) -> bool:
+    """Heuristic: very long lines suggest minified JS/TS."""
     if len(text) < 400:
         return False
     lines = text.splitlines()
@@ -70,6 +72,7 @@ def looks_minified(text: str) -> bool:
 
 
 def family_for(language: str | None, text: str | None = None) -> str:
+    """Calibration family for a language (``other`` when unknown)."""
     if not language:
         return "other"
     fam = _LANGUAGE_FAMILY.get(language, "other")
@@ -79,6 +82,7 @@ def family_for(language: str | None, text: str | None = None) -> str:
 
 
 def estimate_tokens_raw(text: str) -> int:
+    """Uncalibrated token estimate (before the family factor)."""
     if not text:
         return 0
     total = 0
@@ -89,6 +93,7 @@ def estimate_tokens_raw(text: str) -> int:
 
 
 def estimate_tokens(text: str, language: str | None = None) -> int:
+    """Estimated token count for ``text``. An estimate, never exact."""
     raw = estimate_tokens_raw(text)
     if raw == 0:
         return 0

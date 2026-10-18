@@ -15,11 +15,13 @@ from . import secrets
 
 
 def report_json_text(report: dict) -> str:
+    """Serialise a report deterministically (sorted keys, no timestamps)."""
     return json.dumps(report, indent=2, sort_keys=True,
                       ensure_ascii=False) + "\n"
 
 
 def render_md(report: dict) -> str:
+    """Render ``REPLAY.md`` from the same dict as the JSON report."""
     t = report["totals"]
     lines = [
         "# GhostReplay session report",
@@ -72,6 +74,23 @@ def render_md(report: dict) -> str:
                          f"{r['extra_reads']} | {r['estimated_reread_tokens']} |")
     else:
         lines.append("None.")
+    if report.get("turn_timeline"):
+        lines += ["", "## Turn timeline", "",
+                  "One row per turn. Re-read tokens are charged "
+                  "only when a turn names a file as a tool input "
+                  "that an earlier turn already named; they sum to "
+                  "the re-read waste total above.", ""]
+        lines.append("| Turn | Direct reads | Edits | Re-read files | "
+                     "Re-read tokens (est.) | Cumulative (est.) |")
+        lines.append("|---|---|---|---|---|---|")
+        for row in report["turn_timeline"]:
+            lines.append(
+                f"| {row['turn']} | "
+                f"{', '.join(row['direct_read_files']) or '-'} | "
+                f"{', '.join(row['edited_files']) or '-'} | "
+                f"{', '.join(row['reread_files']) or '-'} | "
+                f"{row['reread_estimated_tokens']} | "
+                f"{row['cumulative_reread_estimated_tokens']} |")
     lines += ["", "## Mode friction", "",
               "Files sent in a non-full mode that the session later "
               "pulled in directly with a Read (the agent asking for "
@@ -119,6 +138,7 @@ def render_md(report: dict) -> str:
 
 
 def write_reports(report: dict, out_dir: str | Path) -> tuple[Path, Path]:
+    """Write ``replay-report.json`` + ``REPLAY.md``; return ``(json, md)``."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     json_path = out_dir / "replay-report.json"

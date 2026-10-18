@@ -4,6 +4,21 @@ These are **expectations written from the fixtures**, not captured tool
 output. If a real run disagrees, the run (or this file) is wrong and the
 disagreement is worth reporting.
 
+Before you run: run all commands below from the repo root. If
+`ghostreplay` is not installed, prefix each command with
+`PYTHONPATH=src python3 -m` instead (for example
+`PYTHONPATH=src python3 -m ghostreplay analyse ...`), or just run
+`sh examples/run_demo.sh` for the first example. Report and proposal
+output goes to `/tmp`; note that `analyse` also appends one record to
+the sample project's trend ledger
+(`examples/sample_project/.ghostreplay-history.jsonl`), as it does
+for any project. Token figures are estimates throughout.
+
+How to check a run: open the `REPLAY.md` (or `PROPOSAL.md`) the
+command wrote and compare its findings, counts, and token figures
+against the bullets under that example. Console output alone is only
+a summary; the report files are the result.
+
 ## Analyse the planted-waste transcript
 
 ```bash
@@ -27,12 +42,18 @@ finds exactly the planted waste:
 ## Propose from zero waste
 
 ```bash
-ghostreplay propose examples/sample_project examples/transcripts/zero_waste_1.jsonl \
-    <two more zero-waste sessions> --bundle examples/sample_bundle --out /tmp/replay-prop
+ghostreplay propose examples/sample_project \
+    tests/fixtures/sessions/zero_waste_1.jsonl \
+    tests/fixtures/sessions/zero_waste_2.jsonl \
+    tests/fixtures/sessions/zero_waste_3.jsonl \
+    --bundle examples/sample_bundle --out /tmp/replay-prop
 ```
 
 (The examples folder ships one zero-waste transcript; the test fixtures
-carry all three: `tests/fixtures/sessions/zero_waste_*.jsonl`.)
+carry all three, so the command above uses the fixture copies. Three
+sessions are needed because a proposal requires at least 3 by
+default; with fewer, the status is `insufficient-sessions` and no
+changes are proposed.)
 
 Expected: `ghostreplay-proposal.json` with an **empty** changes list. The session
 referenced every bundle file exactly once, so any proposed "saving"

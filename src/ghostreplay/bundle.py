@@ -24,10 +24,53 @@ from pathlib import Path
 
 
 class BundleError(ValueError):
-    pass
+    """The bundle path is missing, unreadable, or not a manifest."""
+
+
+def _token_count(value, field: str, mpath) -> int:
+    """Coerce a manifest token count, loudly. bool is an int
+    subclass (True must not become 1 token), a non-numeric string
+    must surface as BundleError naming the field rather than a
+    bare ValueError from int(), and a fractional float is not a
+    token count."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise BundleError(f"{mpath}: {field} must be a token count, "
+                          f"got {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise BundleError(f"{mpath}: {field} must be a whole "
+                              f"token count, got {value!r}")
+        value = int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise BundleError(f"{mpath}: {field} must be a token count, "
+                          f"got {value!r}") from exc
+
+
+def _symbols(value, field: str, mpath) -> list:
+    """symbols_included must be a list of strings. A bare string
+    used to be list()-split into single characters, inventing
+    one-letter symbols that then 'matched' friction text."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(
+            not isinstance(v, str) for v in value):
+        raise BundleError(f"{mpath}: {field} must be a list of "
+                          f"strings, got {value!r}")
+    return list(value)
 
 
 def load_manifest(bundle: str | Path) -> dict:
+    """Load and normalise a GhostSlice ``manifest.json``.
+
+    ``bundle`` may be a bundle directory or a direct path to
+    ``manifest.json``. Returns a dict with per-file entries plus a
+    ``by_path`` index. Raises :class:`BundleError` on any problem:
+    callers should surface it, never fall back to guessing.
+    """
     bundle = Path(bundle)
     mpath = bundle / "manifest.json" if bundle.is_dir() else bundle
     try:
@@ -50,18 +93,28 @@ def load_manifest(bundle: str | Path) -> dict:
             "path": entry["path"],
             "mode": entry.get("mode") or "full",
             "language": entry.get("language"),
-            "original_tokens": int(entry.get("original_tokens") or 0),
-            "sliced_tokens": int(entry.get("sliced_tokens") or 0),
+            "original_tokens": _token_count(
+                entry.get("original_tokens"),
+                f"files[{i}].original_tokens", mpath),
+            "sliced_tokens": _token_count(
+                entry.get("sliced_tokens"),
+                f"files[{i}].sliced_tokens", mpath),
             "sha256": entry.get("sha256") or "",
-            "symbols_included": list(entry.get("symbols_included") or []),
+            "symbols_included": _symbols(
+                entry.get("symbols_included"),
+                f"files[{i}].symbols_included", mpath),
         })
     return {
         "manifest_path": str(mpath),
         "manifest_sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
         "root": data.get("root"),
         "tool_version": data.get("version"),
-        "total_original_tokens": int(data.get("total_original_tokens") or 0),
-        "total_sliced_tokens": int(data.get("total_sliced_tokens") or 0),
+        "total_original_tokens": _token_count(
+            data.get("total_original_tokens"), "total_original_tokens",
+            mpath),
+        "total_sliced_tokens": _token_count(
+            data.get("total_sliced_tokens"), "total_sliced_tokens",
+            mpath),
         "files": files,
         "by_path": {f["path"]: f for f in files},
     }
@@ -69,6 +122,13 @@ def load_manifest(bundle: str | Path) -> dict:
 
 def find_bundle(project: str | Path,
                 explicit: str | Path | None = None) -> dict | None:
+    """Resolve which bundle to join against, or ``None``.
+
+    An explicit bundle always wins; otherwise
+    ``<project>/.claude_context/manifest.json`` is used when it
+    exists. ``None`` is a valid result: analysis still runs, with
+    bundle-dependent sections reported as unavailable.
+    """
     if explicit is not None:
         return load_manifest(explicit)
     candidate = Path(project) / ".claude_context" / "manifest.json"
